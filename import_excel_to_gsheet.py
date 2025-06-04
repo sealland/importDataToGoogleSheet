@@ -210,7 +210,6 @@ def main():
 
         if not existing_data: # ถ้า sheet ว่าง หรือไม่มี header
             print(f"Sheet '{TARGET_SHEET_NAME}' ว่างเปล่า หรือไม่มี header. กำลังอัปโหลดข้อมูลพร้อม header จาก Excel...")
-            # ล้างข้อมูลเก่า (ถ้ามีอะไรค้างอยู่แบบไม่มี header)
             worksheet.clear()
             data_to_gsheet = [df_to_upload.columns.values.tolist()] + df_to_upload.values.tolist()
             if data_to_gsheet and data_to_gsheet[0]:  # ตรวจสอบว่ามี header และข้อมูล
