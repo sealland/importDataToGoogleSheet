@@ -82,6 +82,14 @@ target/
 profile_default/
 ipython_config.py
 
+token.json
+credentials.json
+importer_app_settings.v2.pkl
+# สร้างหรือแก้ไข .gitignore ให้มี token.json
+# echo "token.json" >> .gitignore  # ตัวอย่างการเพิ่มเข้าไปใน .gitignore
+# echo "credentials.json" >> .gitignore # ถ้าต้องการ
+# echo "importer_app_settings.v2.pkl" >> .gitignore # ถ้าต้องการ
+
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is
 #   intended to run in multiple environments; otherwise, check them in:
