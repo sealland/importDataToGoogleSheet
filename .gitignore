@@ -99,11 +99,10 @@ venv.bak/
 *~                # General backup files
 .DS_Store         # macOS
 
-# Sensitive configuration files & Tokens
-credentials.json  # Google OAuth Client Secret (ถ้าคุณตัดสินใจไม่ commit)
-token.json        # Google OAuth Access/Refresh Tokens (สำคัญมาก ห้าม commit)
-importer_app_settings.v2.pkl # ไฟล์ตั้งค่าที่ผู้ใช้กรอก อาจจะมี Sheet ID หรือ Path
-authorized_user.json  # <<--- เพิ่มไฟล์นี้เข้าไปด้วย ถ้ามันถูกสร้างขึ้น
+# Google OAuth files
+token.json
+credentials.json
+authorized_user.json
 
 # Excel temporary files (ถ้ามีโอกาสสร้างใน project directory)
 ~$*.xlsx
