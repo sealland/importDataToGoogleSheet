@@ -10,14 +10,36 @@ import customtkinter as ctk # GUI Library
 from tkinter import filedialog, messagebox
 import threading # สำหรับรัน process import ใน background
 import time # สำหรับสาธิต progress bar (ถ้าต้องการ)
+import sys
 
 # --- ชื่อไฟล์สำหรับบันทึกการตั้งค่าทั้งหมดของแอป ---
 APP_SETTINGS_FILE = "importer_app_settings.v3.pkl" # ตั้งชื่อใหม่เผื่อมีเวอร์ชันเก่า
 
+def get_application_path():
+    if getattr(sys, 'frozen', False):
+        # ถ้าโปรแกรมถูก frozen (เช่น โดย PyInstaller)
+        application_path = os.path.dirname(sys.executable)
+    elif __file__:
+        # ถ้าเป็นสคริปต์ Python ปกติ
+        application_path = os.path.dirname(__file__)
+    else:
+        # Fallback (เช่น ถ้าอยู่ใน interactive session ที่ไม่มี __file__)
+        application_path = os.getcwd()
+    return application_path
+
+
+# --- ตัวอย่างการใช้งาน ---
+BASE_DIR = get_application_path()
+CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.json")
+TOKEN_FILE = os.path.join(BASE_DIR, "token.json")
+APP_SETTINGS_FILE = os.path.join(BASE_DIR, "importer_app_settings.v3.pkl")
+SETTINGS_FILE = os.path.join(BASE_DIR, "import_settings.pkl") # ถ้ามี
+
 # --- การตั้งค่าเริ่มต้น (อาจจะถูก override ด้วยค่าที่จำไว้) ---
 DEFAULT_EXCEL_DIR = os.path.expanduser("~") # เริ่มที่ Home directory ของ User
 DEFAULT_GOOGLE_SHEET_ID = ""
-SETTINGS_FILE = "import_settings.pkl" # ไฟล์สำหรับบันทึกค่า
+
+
 
 
 # --- การตั้งค่า ---
