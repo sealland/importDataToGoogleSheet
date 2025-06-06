@@ -11,33 +11,28 @@ from tkinter import filedialog, messagebox
 import threading # สำหรับรัน process import ใน background
 import time # สำหรับสาธิต progress bar (ถ้าต้องการ)
 import sys
+import os
+
+import time
+import glob
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
+from selenium.webdriver.common.action_chains import ActionChains
+import traceback
 
 # --- ชื่อไฟล์สำหรับบันทึกการตั้งค่าทั้งหมดของแอป ---
 APP_SETTINGS_FILE = "importer_app_settings.v3.pkl" # ตั้งชื่อใหม่เผื่อมีเวอร์ชันเก่า
 
-def get_application_path():
-    if getattr(sys, 'frozen', False):
-        # ถ้าโปรแกรมถูก frozen (เช่น โดย PyInstaller)
-        application_path = os.path.dirname(sys.executable)
-    elif __file__:
-        # ถ้าเป็นสคริปต์ Python ปกติ
-        application_path = os.path.dirname(__file__)
-    else:
-        # Fallback (เช่น ถ้าอยู่ใน interactive session ที่ไม่มี __file__)
-        application_path = os.getcwd()
-    return application_path
 
-
-# --- ตัวอย่างการใช้งาน ---
-BASE_DIR = get_application_path()
-CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.json")
-TOKEN_FILE = os.path.join(BASE_DIR, "token.json")
-APP_SETTINGS_FILE = os.path.join(BASE_DIR, "importer_app_settings.v3.pkl")
-SETTINGS_FILE = os.path.join(BASE_DIR, "import_settings.pkl") # ถ้ามี
 
 # --- การตั้งค่าเริ่มต้น (อาจจะถูก override ด้วยค่าที่จำไว้) ---
 DEFAULT_EXCEL_DIR = os.path.expanduser("~") # เริ่มที่ Home directory ของ User
-DEFAULT_GOOGLE_SHEET_ID = ""
+DEFAULT_GOOGLE_SHEET_ID = "1Hm-B14iz3GTaQlKTeba3O8srq1vFW3Ur8EEX_DRJ2lU"
 
 
 
@@ -74,6 +69,14 @@ DEFAULT_DOCUMENT_CONFIGS = {
         "last_used_excel_dir": os.path.expanduser("~"),
         "last_used_gsheet_id_input": ""
     },
+    "RUN_ALL_AUTO": {
+        "display_name": "อัตโนมัติทั้งหมด (PO และ QO)",
+        "document_type_code": "ALL",
+        "target_sheet_name": "N/A", # ไม่ใช้ในโหมดนี้
+        "header_row_excel": 0,      # ไม่ใช้ในโหมดนี้
+        "last_used_excel_dir": os.path.expanduser("~"),
+        "last_used_gsheet_id_input": "" # จะใช้ gsheet id จาก PO หรืออันล่าสุดแทน
+    }
     # SO_HEADER, SO_DETAIL, DO_HEADER, DO_DETAIL สามารถเพิ่มตามรูปแบบนี้ได้
 }
 current_app_configs = {} # จะถูก init โดย load_app_settings
@@ -89,6 +92,477 @@ app = None
 log_textbox = None
 progressbar = None # Global reference for progress bar
 log_frame_visible = True # สถานะการมองเห็นของ Log Frame
+
+def get_application_path():
+    if getattr(sys, 'frozen', False):
+        # ถ้าโปรแกรมถูก frozen (เช่น โดย PyInstaller)
+        application_path = os.path.dirname(sys.executable)
+    elif __file__:
+        # ถ้าเป็นสคริปต์ Python ปกติ
+        application_path = os.path.dirname(__file__)
+    else:
+        # Fallback (เช่น ถ้าอยู่ใน interactive session ที่ไม่มี __file__)
+        application_path = os.getcwd()
+    return application_path
+
+BASE_DIR = get_application_path()
+CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.json")
+TOKEN_FILE = os.path.join(BASE_DIR, "token.json")
+APP_SETTINGS_FILE = os.path.join(BASE_DIR, "importer_app_settings.v3.pkl")
+SETTINGS_FILE = os.path.join(BASE_DIR, "import_settings.pkl") # ถ้ามี
+
+
+# <<< START OF THE FINAL, COMPLETE FUNCTION FOR PURCHASE ORDER >>>
+def download_peak_purchase_order_report(username, password, target_business_name_to_select,
+                                        save_directory, desired_file_name="peak_po_report.xlsx", log_callback=None):
+    print("--- [DEBUG] INSIDE download_peak_purchase_order_report FUNCTION (FINAL VERSION) ---")
+
+    def _log(msg):
+        if log_callback:
+            log_callback(msg)
+        else:
+            print(f"[PEAK_PO_Downloader_LOG] {msg}")
+
+    _log("Function started.")
+    download_path = os.path.abspath(save_directory)
+
+    # --- Setup: Create folder and clean old files ---
+    if not os.path.exists(download_path):
+        os.makedirs(download_path)
+        _log(f"สร้างโฟลเดอร์ดาวน์โหลด: {download_path}")
+
+    for f in glob.glob(os.path.join(download_path, "*.xlsx")):
+        if os.path.basename(f) == desired_file_name or "purchaseOrder_report_export_" in os.path.basename(f):
+            try:
+                os.remove(f)
+                _log(f"ลบไฟล์ report เก่าที่อาจค้างอยู่: {f}")
+            except Exception as e_rm_old:
+                _log(f"!!! Warning: ไม่สามารถลบไฟล์เก่า '{f}': {e_rm_old} !!!")
+
+    # --- Setup WebDriver ---
+    chrome_options = webdriver.ChromeOptions()
+    prefs = {
+        "download.default_directory": download_path, "download.prompt_for_download": False,
+        "download.directory_upgrade": True, "safebrowsing.enabled": True
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+    chrome_options.add_argument("--start-maximized")
+    driver = None
+    try:
+        _log("กำลังเริ่ม WebDriver...")
+        driver_service = ChromeService(executable_path=ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=driver_service, options=chrome_options)
+
+        wait = WebDriverWait(driver, 30)
+        long_wait = WebDriverWait(driver, 45)
+        short_wait = WebDriverWait(driver, 15)
+
+        # --------------------------------------------------------------------
+        # ขั้นตอนที่ 1: Login และ เลือกกิจการ (เหมือนกัน)
+        # --------------------------------------------------------------------
+        _log("ขั้นตอนที่ 1: Login และ เลือกกิจการ...")
+        driver.get("https://secure.peakaccount.com/login")
+        wait.until(EC.presence_of_element_located((By.NAME, "email"))).send_keys(username)
+        wait.until(EC.presence_of_element_located((By.NAME, "password"))).send_keys(password)
+        wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space(.)='เข้าสู่ระบบ PEAK']"))).click()
+        long_wait.until(
+            EC.any_of(EC.url_contains("selectlist"), EC.presence_of_element_located((By.ID, "mainNavBarBottom"))))
+
+        if "selectlist" in driver.current_url.lower():
+            _log("อยู่ที่หน้าเลือกกิจการ...")
+            business_item_xpath = f"//p[contains(@class, 'textBold') and normalize-space(.)='{target_business_name_to_select}']"
+            long_wait.until(EC.element_to_be_clickable((By.XPATH, business_item_xpath))).click()
+        _log("เข้าสู่กิจการสำเร็จ.")
+        long_wait.until(EC.presence_of_element_located((By.ID, "mainNavBarBottom")))
+        _log("ขั้นตอนที่ 1 เสร็จสิ้น.")
+
+        # --------------------------------------------------------------------
+        # ขั้นตอนที่ 2: นำทางไปยังหน้า Purchase Order
+        # --------------------------------------------------------------------
+        _log("ขั้นตอนที่ 2: การนำทางไปยังหน้า Purchase Order...")
+        actions = ActionChains(driver)
+        expense_menu_xpath = "//li[@id='Menu_expense']/descendant::a[contains(normalize-space(.), 'รายจ่าย')][1]"
+        po_submenu_to_hover_xpath = "//li[@id='Menu_expense']//div[contains(@class, 'dropdown menu-margin')]//div[@name='selectDropdown'][.//a[normalize-space(.)='ใบสั่งซื้อ']]//a[@class='nameSelect' and normalize-space(.)='ใบสั่งซื้อ']"
+        view_all_po_actual_link_xpath = "//li[@id='Menu_expense']//div[@name='selectDropdown'][.//a[normalize-space(.)='ใบสั่งซื้อ']]//div[contains(@class, 'optionDropdown')]//a[@class='nemeOption' and normalize-space(.)='ดูทั้งหมด']"
+
+        actions.move_to_element(wait.until(EC.visibility_of_element_located((By.XPATH, expense_menu_xpath)))).perform()
+        time.sleep(1.5)
+        actions.move_to_element(
+            wait.until(EC.visibility_of_element_located((By.XPATH, po_submenu_to_hover_xpath)))).perform()
+        time.sleep(1.5)
+        wait.until(EC.element_to_be_clickable((By.XPATH, view_all_po_actual_link_xpath))).click()
+
+        long_wait.until(lambda d: "/expense/po" in d.current_url.lower())
+        _log("อยู่ที่หน้า 'ใบสั่งซื้อ' ถูกต้องแล้ว.")
+        driver.find_element(By.TAG_NAME, "body").click()  # ปิดเมนูที่ค้าง
+        time.sleep(1)
+        _log("ขั้นตอนที่ 2 เสร็จสิ้น.")
+
+        # --------------------------------------------------------------------
+        # ขั้นตอนที่ 3: สั่งพิมพ์รายงาน
+        # --------------------------------------------------------------------
+        _log("ขั้นตอนที่ 3: คลิกปุ่ม 'พิมพ์รายงาน' และจัดการ Pop-up...")
+        wait.until(EC.element_to_be_clickable((By.XPATH,
+                                               "//div[contains(@class, 'header-section')]//button[contains(normalize-space(.), 'พิมพ์รายงาน')]"))).click()
+        modal_xpath = "//div[@id='modalBox' and @showmodal='true']"
+        wait.until(EC.visibility_of_element_located((By.XPATH, modal_xpath)))
+        _log("Pop-up ปรากฏแล้ว.")
+        wait.until(EC.element_to_be_clickable(
+            (By.XPATH, f"{modal_xpath}//label[.//p[normalize-space(.)='แสดงรายละเอียด']]"))).click()
+        checkbox_names = ["ใบสั่งซื้อสินทรัพย์", "ข้อมูลราคาและภาษี", "กลุ่มจัดประเภท", "ข้อมูลอื่น", "ประวัติเอกสาร",
+                          "เอกสารที่ถูกยกเลิก"]
+        for name in checkbox_names:
+            wait.until(EC.element_to_be_clickable(
+                (By.XPATH, f"{modal_xpath}//label[.//span[normalize-space(.)='{name}']]"))).click()
+        wait.until(EC.element_to_be_clickable((By.XPATH,
+                                               f"{modal_xpath}//button[contains(normalize-space(.), 'พิมพ์รายงาน') and not(ancestor::div[contains(@class,'secondary')])]"))).click()
+        _log("สั่งพิมพ์รายงานใน Pop-up แล้ว.")
+
+        # --------------------------------------------------------------------
+        # ขั้นตอนที่ 4: Polling & Download (Fire and Forget + File Check)
+        # --------------------------------------------------------------------
+        _log("ขั้นตอนที่ 4: เริ่มกระบวนการตรวจสอบ Notification...")
+        NOTIFICATION_TIMEOUT_SECONDS = 300
+        POLLING_INTERVAL_SECONDS = 15
+        bell_icon_to_click_xpath = "//div[@id='notification']//a[contains(@class, 'fa-bell')]"
+        notification_panel_xpath = "//div[contains(@class, 'dropdownNotification') and contains(@class, 'showNotification')]"
+        body_element_xpath = "//body"
+
+        start_time = time.time()
+        download_triggered = False
+
+        while time.time() - start_time < NOTIFICATION_TIMEOUT_SECONDS:
+            try:
+                _log("...กำลังตรวจสอบ Notification...")
+
+                # 1. คลิกกระดิ่ง
+                try:
+                    bell_icon = short_wait.until(EC.element_to_be_clickable((By.XPATH, bell_icon_to_click_xpath)))
+                    driver.execute_script("arguments[0].click();", bell_icon)
+                except Exception:
+                    driver.find_element(By.XPATH, body_element_xpath).click();
+                    time.sleep(1)
+                    bell_icon = short_wait.until(EC.element_to_be_clickable((By.XPATH, bell_icon_to_click_xpath)))
+                    driver.execute_script("arguments[0].click();", bell_icon)
+
+                # 2. รอ Panel และเนื้อหา
+                wait.until(EC.visibility_of_element_located((By.XPATH, notification_panel_xpath)))
+                time.sleep(2)
+
+                # 3. ยิง JavaScript (Fire and Forget)
+                _log("   กำลังใช้ JavaScript เพื่อ 'พยายาม' คลิกปุ่มดาวน์โหลด...")
+                js_script = """
+                const items = document.querySelectorAll('.notificationItem');
+                for (let i = items.length - 1; i >= 0; i--) {
+                    const item = items[i];
+                    if (item.querySelector('h3')?.textContent.includes('รายงานใบสั่งซื้อ')) {
+                        const btn = item.querySelector('.hyperLinkText');
+                        if (btn?.textContent.trim() === 'ดาวน์โหลด') {
+                            btn.click();
+                            break; 
+                        }
+                    }
+                }
+                """
+                driver.execute_script(js_script)
+
+                # 4. ตรวจสอบผลลัพธ์ด้วยไฟล์
+                _log("   ยิง Script เสร็จสิ้น. จะเริ่มตรวจสอบไฟล์ในโฟลเดอร์...")
+                FILE_CHECK_TIMEOUT = 10
+                file_check_start_time = time.time()
+                download_started = False
+                while time.time() - file_check_start_time < FILE_CHECK_TIMEOUT:
+                    if glob.glob(os.path.join(download_path, "*.crdownload")) or glob.glob(
+                            os.path.join(download_path, "purchaseOrder_report_export_*.xlsx")):
+                        _log("   ตรวจพบไฟล์ใหม่! การดาวน์โหลดเริ่มต้นแล้ว!")
+                        download_started = True
+                        break
+                    time.sleep(1)
+
+                if download_started:
+                    download_triggered = True
+                    break
+
+                _log("   ไม่พบไฟล์ใหม่ในรอบนี้. จะลองในรอบถัดไป")
+
+            except Exception as e_poll:
+                _log(f"!!! Error ระหว่างการ Polling: {e_poll} !!!")
+
+            if not download_triggered:
+                try:
+                    driver.find_element(By.XPATH, body_element_xpath).click()
+                except:
+                    pass
+                time.sleep(POLLING_INTERVAL_SECONDS - (FILE_CHECK_TIMEOUT + 4))
+
+        if not download_triggered:
+            _log(f"!!! ล้มเหลว: หมดเวลา {NOTIFICATION_TIMEOUT_SECONDS} วินาทีแล้ว แต่ยังไม่พบรายงานให้ดาวน์โหลด !!!")
+            return None
+
+        # --------------------------------------------------------------------
+        # ขั้นตอนที่ 5: รอไฟล์ดาวน์โหลดให้เสร็จสมบูรณ์
+        # --------------------------------------------------------------------
+        _log("ขั้นตอนที่ 5: รอไฟล์ดาวน์โหลดให้เสร็จสมบูรณ์...")
+        DOWNLOAD_WAIT_TIMEOUT = 120
+        wait_start_time = time.time()
+        final_filepath = None
+        while time.time() - wait_start_time < DOWNLOAD_WAIT_TIMEOUT:
+            if not glob.glob(os.path.join(download_path, "*.crdownload")):
+                # ** แก้ไขชื่อไฟล์ที่ค้นหาให้ถูกต้อง **
+                xlsx_files = glob.glob(os.path.join(download_path, "purchaseOrder_report_export_*.xlsx"))
+                if xlsx_files:
+                    downloaded_file = xlsx_files[0]
+                    _log(f"ตรวจพบไฟล์ที่ดาวน์โหลดเสร็จแล้ว: {downloaded_file}")
+                    final_filepath_target = os.path.join(download_path, desired_file_name)
+                    os.rename(downloaded_file, final_filepath_target)
+                    _log(f"เปลี่ยนชื่อไฟล์เป็น: {final_filepath_target}")
+                    final_filepath = final_filepath_target
+                    break
+            time.sleep(1)
+
+        if not final_filepath:
+            _log(f"!!! ล้มเหลว: หมดเวลารอไฟล์ดาวน์โหลด ({DOWNLOAD_WAIT_TIMEOUT} วินาที) !!!")
+            return None
+
+        _log("🎉🎉🎉 ดาวน์โหลดและเปลี่ยนชื่อไฟล์รายงานใบสั่งซื้อสำเร็จ! 🎉🎉🎉")
+        return final_filepath
+
+    except Exception as e:
+        _log(f"!!! Fatal Error (Overall Function Level): {e} !!!")
+        _log(traceback.format_exc())
+        return None
+    finally:
+        if driver:
+            driver.quit()
+        _log("Function finished.")
+
+
+# <<< END OF THE FINAL, COMPLETE FUNCTION FOR PURCHASE ORDER >>>
+
+# <<< START OF THE FINAL, COMPLETE FUNCTION FOR QUOTATION >>>
+def download_peak_quotation_report(username, password, target_business_name_to_select,
+                                   save_directory, desired_file_name="peak_quotation_report.xlsx", log_callback=None):
+    print("--- [DEBUG] INSIDE download_peak_quotation_report FUNCTION (FINAL VERSION) ---")
+
+    def _log(msg):
+        if log_callback:
+            log_callback(msg)
+        else:
+            print(f"[PEAK_QT_Downloader_LOG] {msg}")
+
+    _log("Function started.")
+    download_path = os.path.abspath(save_directory)
+
+    # --- Setup: Create folder and clean old files ---
+    if not os.path.exists(download_path):
+        os.makedirs(download_path)
+        _log(f"สร้างโฟลเดอร์ดาวน์โหลด: {download_path}")
+
+    for f in glob.glob(os.path.join(download_path, "*.xlsx")):
+        if os.path.basename(f) == desired_file_name or "quotation_report_export_" in os.path.basename(f):
+            try:
+                os.remove(f)
+                _log(f"ลบไฟล์ report เก่าที่อาจค้างอยู่: {f}")
+            except Exception as e_rm_old:
+                _log(f"!!! Warning: ไม่สามารถลบไฟล์เก่า '{f}': {e_rm_old} !!!")
+
+    # --- Setup WebDriver ---
+    chrome_options = webdriver.ChromeOptions()
+    prefs = {
+        "download.default_directory": download_path, "download.prompt_for_download": False,
+        "download.directory_upgrade": True, "safebrowsing.enabled": True
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+    chrome_options.add_argument("--start-maximized")
+    driver = None
+    try:
+        _log("กำลังเริ่ม WebDriver...")
+        driver_service = ChromeService(executable_path=ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=driver_service, options=chrome_options)
+
+        wait = WebDriverWait(driver, 30)
+        long_wait = WebDriverWait(driver, 45)
+        short_wait = WebDriverWait(driver, 15)
+
+        # --------------------------------------------------------------------
+        # ขั้นตอนที่ 1: Login และ เลือกกิจการ
+        # --------------------------------------------------------------------
+        _log("ขั้นตอนที่ 1: Login และ เลือกกิจการ...")
+        driver.get("https://secure.peakaccount.com/login")
+        wait.until(EC.presence_of_element_located((By.NAME, "email"))).send_keys(username)
+        wait.until(EC.presence_of_element_located((By.NAME, "password"))).send_keys(password)
+        wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space(.)='เข้าสู่ระบบ PEAK']"))).click()
+        long_wait.until(
+            EC.any_of(EC.url_contains("selectlist"), EC.presence_of_element_located((By.ID, "mainNavBarBottom"))))
+
+        if "selectlist" in driver.current_url.lower():
+            _log("อยู่ที่หน้าเลือกกิจการ...")
+            business_item_xpath = f"//p[contains(@class, 'textBold') and normalize-space(.)='{target_business_name_to_select}']"
+            long_wait.until(EC.element_to_be_clickable((By.XPATH, business_item_xpath))).click()
+        _log("เข้าสู่กิจการสำเร็จ.")
+        long_wait.until(EC.presence_of_element_located((By.ID, "mainNavBarBottom")))
+        _log("ขั้นตอนที่ 1 เสร็จสิ้น.")
+
+        # --------------------------------------------------------------------
+        # ขั้นตอนที่ 2: นำทางไปยังหน้า Quotation
+        # --------------------------------------------------------------------
+        _log("ขั้นตอนที่ 2: การนำทางไปยังหน้า Quotation...")
+        actions = ActionChains(driver)
+        income_menu_xpath = "//li[@id='Menu_income']/descendant::a[contains(normalize-space(.), 'รายรับ')][1]"
+        quotation_submenu_to_hover_xpath = "//li[@id='Menu_income']//div[contains(@class, 'dropdown menu-margin')]//a[normalize-space(.)='ใบเสนอราคา']"
+        view_all_quotation_link_xpath = "//li[@id='Menu_income']//div[.//a[normalize-space(.)='ใบเสนอราคา']]//a[normalize-space(.)='ดูทั้งหมด']"
+
+        actions.move_to_element(wait.until(EC.visibility_of_element_located((By.XPATH, income_menu_xpath)))).perform()
+        time.sleep(1.5)
+        actions.move_to_element(
+            wait.until(EC.visibility_of_element_located((By.XPATH, quotation_submenu_to_hover_xpath)))).perform()
+        time.sleep(1.5)
+        wait.until(EC.element_to_be_clickable((By.XPATH, view_all_quotation_link_xpath))).click()
+
+        long_wait.until(lambda d: "income/quotation" in d.current_url.lower())
+        _log("อยู่ที่หน้า 'ใบเสนอราคา' ถูกต้องแล้ว.")
+        driver.find_element(By.TAG_NAME, "body").click()  # ปิดเมนูที่ค้าง
+        time.sleep(1)
+        _log("ขั้นตอนที่ 2 เสร็จสิ้น.")
+
+        # --------------------------------------------------------------------
+        # ขั้นตอนที่ 3: สั่งพิมพ์รายงาน
+        # --------------------------------------------------------------------
+        _log("ขั้นตอนที่ 3: คลิกปุ่ม 'พิมพ์รายงาน' และจัดการ Pop-up...")
+        wait.until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(normalize-space(.), 'พิมพ์รายงาน')]"))).click()
+        modal_xpath = "//div[@id='modalBox' and @showmodal='true']"
+        wait.until(EC.visibility_of_element_located((By.XPATH, modal_xpath)))
+        _log("Pop-up ปรากฏแล้ว.")
+        wait.until(EC.element_to_be_clickable(
+            (By.XPATH, f"{modal_xpath}//label[.//p[normalize-space(.)='แสดงรายละเอียด']]"))).click()
+        checkbox_names = ["ข้อมูลราคาและภาษี", "กลุ่มจัดประเภท", "ข้อมูลอื่น", "ประวัติเอกสาร", "เอกสารที่ถูกยกเลิก"]
+        for name in checkbox_names:
+            wait.until(EC.element_to_be_clickable(
+                (By.XPATH, f"{modal_xpath}//label[.//span[normalize-space(.)='{name}']]"))).click()
+        wait.until(EC.element_to_be_clickable((By.XPATH,
+                                               f"{modal_xpath}//button[contains(normalize-space(.), 'พิมพ์รายงาน') and not(ancestor::div[contains(@class,'secondary')])]"))).click()
+        _log("สั่งพิมพ์รายงานใน Pop-up แล้ว.")
+
+        # --------------------------------------------------------------------
+        # ขั้นตอนที่ 4: Polling & Download (Fire and Forget + File Check)
+        # --------------------------------------------------------------------
+        _log("ขั้นตอนที่ 4: เริ่มกระบวนการตรวจสอบ Notification...")
+        NOTIFICATION_TIMEOUT_SECONDS = 300
+        POLLING_INTERVAL_SECONDS = 15
+        bell_icon_to_click_xpath = "//div[@id='notification']//a[contains(@class, 'fa-bell')]"
+        notification_panel_xpath = "//div[contains(@class, 'dropdownNotification') and contains(@class, 'showNotification')]"
+        body_element_xpath = "//body"
+
+        start_time = time.time()
+        download_triggered = False
+
+        while time.time() - start_time < NOTIFICATION_TIMEOUT_SECONDS:
+            try:
+                _log("...กำลังตรวจสอบ Notification...")
+
+                # 1. คลิกกระดิ่ง
+                try:
+                    bell_icon = short_wait.until(EC.element_to_be_clickable((By.XPATH, bell_icon_to_click_xpath)))
+                    driver.execute_script("arguments[0].click();", bell_icon)
+                except Exception:
+                    driver.find_element(By.XPATH, body_element_xpath).click();
+                    time.sleep(1)
+                    bell_icon = short_wait.until(EC.element_to_be_clickable((By.XPATH, bell_icon_to_click_xpath)))
+                    driver.execute_script("arguments[0].click();", bell_icon)
+
+                # 2. รอ Panel และเนื้อหา
+                wait.until(EC.visibility_of_element_located((By.XPATH, notification_panel_xpath)))
+                time.sleep(2)
+
+                # 3. ยิง JavaScript (Fire and Forget)
+                _log("   กำลังใช้ JavaScript เพื่อ 'พยายาม' คลิกปุ่มดาวน์โหลด...")
+                js_script = """
+                const items = document.querySelectorAll('.notificationItem');
+                for (let i = items.length - 1; i >= 0; i--) {
+                    const item = items[i];
+                    if (item.querySelector('h3')?.textContent.includes('รายงานใบเสนอราคา')) {
+                        const btn = item.querySelector('.hyperLinkText');
+                        if (btn?.textContent.trim() === 'ดาวน์โหลด') {
+                            btn.click();
+                            break; 
+                        }
+                    }
+                }
+                """
+                driver.execute_script(js_script)
+
+                # 4. ตรวจสอบผลลัพธ์ด้วยไฟล์
+                _log("   ยิง Script เสร็จสิ้น. จะเริ่มตรวจสอบไฟล์ในโฟลเดอร์...")
+                FILE_CHECK_TIMEOUT = 10
+                file_check_start_time = time.time()
+                download_started = False
+                while time.time() - file_check_start_time < FILE_CHECK_TIMEOUT:
+                    if glob.glob(os.path.join(download_path, "*.crdownload")) or glob.glob(
+                            os.path.join(download_path, "quotation_report_export_*.xlsx")):
+                        _log("   ตรวจพบไฟล์ใหม่! การดาวน์โหลดเริ่มต้นแล้ว!")
+                        download_started = True
+                        break
+                    time.sleep(1)
+
+                if download_started:
+                    download_triggered = True
+                    break
+
+                _log("   ไม่พบไฟล์ใหม่ในรอบนี้. จะลองในรอบถัดไป")
+
+            except Exception as e_poll:
+                _log(f"!!! Error ระหว่างการ Polling: {e_poll} !!!")
+
+            if not download_triggered:
+                try:
+                    driver.find_element(By.XPATH, body_element_xpath).click()
+                except:
+                    pass
+                time.sleep(POLLING_INTERVAL_SECONDS - (FILE_CHECK_TIMEOUT + 4))
+
+        if not download_triggered:
+            _log(f"!!! ล้มเหลว: หมดเวลา {NOTIFICATION_TIMEOUT_SECONDS} วินาทีแล้ว แต่ยังไม่พบรายงานให้ดาวน์โหลด !!!")
+            return None
+
+        # --------------------------------------------------------------------
+        # ขั้นตอนที่ 5: รอไฟล์ดาวน์โหลดให้เสร็จสมบูรณ์
+        # --------------------------------------------------------------------
+        _log("ขั้นตอนที่ 5: รอไฟล์ดาวน์โหลดให้เสร็จสมบูรณ์...")
+        DOWNLOAD_WAIT_TIMEOUT = 120
+        wait_start_time = time.time()
+        final_filepath = None
+        while time.time() - wait_start_time < DOWNLOAD_WAIT_TIMEOUT:
+            if not glob.glob(os.path.join(download_path, "*.crdownload")):
+                xlsx_files = glob.glob(os.path.join(download_path, "quotation_report_export_*.xlsx"))
+                if xlsx_files:
+                    downloaded_file = xlsx_files[0]
+                    _log(f"ตรวจพบไฟล์ที่ดาวน์โหลดเสร็จแล้ว: {downloaded_file}")
+                    final_filepath_target = os.path.join(download_path, desired_file_name)
+                    os.rename(downloaded_file, final_filepath_target)
+                    _log(f"เปลี่ยนชื่อไฟล์เป็น: {final_filepath_target}")
+                    final_filepath = final_filepath_target
+                    break
+            time.sleep(1)
+
+        if not final_filepath:
+            _log(f"!!! ล้มเหลว: หมดเวลารอไฟล์ดาวน์โหลด ({DOWNLOAD_WAIT_TIMEOUT} วินาที) !!!")
+            return None
+
+        _log("🎉🎉🎉 ดาวน์โหลดและเปลี่ยนชื่อไฟล์รายงานใบเสนอราคาสำเร็จ! 🎉🎉🎉")
+        return final_filepath
+
+    except Exception as e:
+        _log(f"!!! Fatal Error (Overall Function Level): {e} !!!")
+        _log(traceback.format_exc())
+        return None
+    finally:
+        if driver:
+            driver.quit()
+        _log("Function finished.")
+
+
+# <<< END OF THE FINAL, COMPLETE FUNCTION FOR QUOTATION >>>
 
 def authenticate_google_sheets():
     creds = None
@@ -721,14 +1195,39 @@ class App(ctk.CTk):
         gsheet_id_label.pack(side=ctk.LEFT, padx=(0,10))
         self.gsheet_id_entry = ctk.CTkEntry(gsheet_frame, placeholder_text="ใส่ Google Sheet ID ของ Spreadsheet หลัก", width=250)
         self.gsheet_id_entry.pack(side=ctk.LEFT, expand=True, fill="x")
+        self.gsheet_id_entry.insert(0, DEFAULT_GOOGLE_SHEET_ID)
+
+        # --- 3.5 เพิ่มส่วนสำหรับ PEAK Credentials ---
+        peak_frame = ctk.CTkFrame(input_frame, fg_color="transparent")
+        peak_frame.pack(pady=5, fill="x")
+
+        peak_user_label = ctk.CTkLabel(peak_frame, text="PEAK User:")
+        peak_user_label.pack(side=ctk.LEFT, padx=(0, 5))
+        self.peak_user_entry = ctk.CTkEntry(peak_frame, placeholder_text="sirichai.c@zubbsteel.com")
+        self.peak_user_entry.pack(side=ctk.LEFT, expand=True, fill="x", padx=(0, 10))
+
+        peak_pass_label = ctk.CTkLabel(peak_frame, text="PEAK Pass:")
+        peak_pass_label.pack(side=ctk.LEFT, padx=(0, 5))
+        self.peak_pass_entry = ctk.CTkEntry(peak_frame, placeholder_text="ใส่รหัสผ่าน", show="*")
+        self.peak_pass_entry.pack(side=ctk.LEFT, expand=True, fill="x")
 
         # --- 4. Progress Bar, ปุ่ม Import, Log Area (เหมือนเดิม) ---
         progressbar = ctk.CTkProgressBar(main_frame, orientation="horizontal", mode="determinate")
         progressbar.pack(pady=(5, 10), padx=10, fill="x")
         progressbar.set(0)
 
-        self.import_button = ctk.CTkButton(main_frame, text="เริ่ม Import", command=self.start_import_thread, height=40, font=("Arial", 14, "bold"))
-        self.import_button.pack(pady=10)
+        # --- สร้าง Frame สำหรับวางปุ่ม 2 ปุ่ม ---
+        button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        button_frame.pack(pady=10, fill="x")
+
+        self.import_manual_button = ctk.CTkButton(button_frame, text="Import จากไฟล์ที่เลือก",
+                                                  command=self.start_manual_import_thread)
+        self.import_manual_button.pack(side=ctk.LEFT, padx=(0, 10), expand=True)
+
+        self.import_auto_button = ctk.CTkButton(button_frame, text="ดาวน์โหลด & Import อัตโนมัติ",
+                                                command=self.start_auto_import_thread, height=40,
+                                                font=("Arial", 14, "bold"), fg_color="#1F6AA5", hover_color="#144870")
+        self.import_auto_button.pack(side=ctk.LEFT, padx=(0, 0), expand=True)
 
         self.log_outer_frame = ctk.CTkFrame(main_frame)
         self.log_outer_frame.pack(pady=10, padx=10, fill="both", expand=True)
@@ -751,6 +1250,121 @@ class App(ctk.CTk):
             log_message_ui("คำเตือน: ไม่มีการตั้งค่าประเภทเอกสาร")
 
         log_message_ui("โปรแกรมพร้อมทำงาน กรุณาเลือกประเภทเอกสาร ไฟล์ และใส่ Google Sheet ID")
+
+    def start_auto_import_thread(self):
+        # --- Logic สำหรับปุ่ม "ดาวน์โหลด & Import อัตโนมัติ" ---
+        log_message_ui("=" * 10 + " เริ่มกระบวนการดาวน์โหลดและ Import อัตโนมัติ " + "=" * 10)
+
+        # 1. ดึงข้อมูลจาก UI
+        if not self.selected_doc_type_key:
+            messagebox.showerror("ข้อผิดพลาด", "กรุณาเลือกประเภทเอกสาร")
+            return
+
+        google_sheet_id_main = self.gsheet_id_entry.get()
+        if not google_sheet_id_main:
+            messagebox.showerror("ข้อผิดพลาด", "กรุณาใส่ Google Sheet ID")
+            return
+
+        peak_user = self.peak_user_entry.get()
+        peak_pass = self.peak_pass_entry.get()
+        if not peak_user or not peak_pass:
+            messagebox.showerror("ข้อผิดพลาด", "กรุณาใส่ Username และ Password ของ PEAK")
+            return
+
+        # 2. ปิดปุ่ม และเริ่ม Progress Bar
+        self.import_auto_button.configure(state="disabled", text="กำลังทำงาน...")
+        self.import_manual_button.configure(state="disabled")
+        if progressbar:
+            progressbar.configure(mode="indeterminate")
+            progressbar.start()
+
+        # 3. สร้าง Thread ใหม่เพื่อรันกระบวนการทั้งหมด
+        auto_thread = threading.Thread(target=self.run_auto_import_process,
+                                       args=(google_sheet_id_main, peak_user, peak_pass, self.selected_doc_type_key))
+        auto_thread.daemon = True
+        auto_thread.start()
+
+    # ... ในคลาส App ...
+
+    def run_auto_import_process(self, google_sheet_id_main, peak_user, peak_pass, doc_type_key):
+        try:
+            # --- กำหนดลำดับการทำงาน ---
+            tasks_to_run = []
+            if doc_type_key == "RUN_ALL_AUTO":
+                # ถ้าเลือก "อัตโนมัติทั้งหมด" ให้สร้าง list ของงาน
+                tasks_to_run = ["PO_DETAIL", "QO_DETAIL"]
+                log_message_ui(f"--- เริ่มโหมดอัตโนมัติทั้งหมด: {tasks_to_run} ---")
+            else:
+                # ถ้าเลือกงานเดียว ก็ใส่แค่งานนั้นลงใน list
+                tasks_to_run = [doc_type_key]
+
+            # --- วนลูปทำงานตาม Task ที่อยู่ใน List ---
+            for current_task_key in tasks_to_run:
+                log_message_ui(
+                    "\n" + "=" * 15 + f" เริ่มงาน: {current_app_configs[current_task_key]['display_name']} " + "=" * 15)
+
+                downloaded_file_path = None  # รีเซ็ตค่าสำหรับแต่ละ Loop
+
+                # --- ส่วนที่ 1: ดาวน์โหลดไฟล์ ---
+                log_message_ui(f"--- [ส่วนที่ 1] กำลังเริ่มดาวน์โหลดรายงาน '{current_task_key}' จาก PEAK ---")
+
+                temp_download_dir = os.path.join(BASE_DIR, "temp_downloads",
+                                                 current_task_key)  # สร้างโฟลเดอร์ย่อยแยกกัน
+                if not os.path.exists(temp_download_dir):
+                    os.makedirs(temp_download_dir)
+
+                # เลือกฟังก์ชันดาวน์โหลดตาม Task ปัจจุบัน
+                if current_task_key == "PO_DETAIL":
+                    downloaded_file_path = download_peak_purchase_order_report(
+                        username=peak_user,
+                        password=peak_pass,
+                        target_business_name_to_select="บจ. บิซ ฮีโร่ (สำนักงานใหญ่)",
+                        save_directory=temp_download_dir,
+                        desired_file_name=f"peak_po_autodownload.xlsx",
+                        log_callback=log_message_ui
+                    )
+                elif current_task_key == "QO_DETAIL":
+                    downloaded_file_path = download_peak_quotation_report(
+                        username=peak_user,
+                        password=peak_pass,
+                        target_business_name_to_select="บจ. บิซ ฮีโร่ (สำนักงานใหญ่)",
+                        save_directory=temp_download_dir,
+                        desired_file_name=f"peak_qo_autodownload.xlsx",
+                        log_callback=log_message_ui
+                    )
+                else:
+                    log_message_ui(f"Error: ไม่รู้จัก Task '{current_task_key}'")
+                    continue  # ข้ามไปทำงาน Task ถัดไป (ถ้ามี)
+
+                # --- ส่วนที่ 2: Import ไฟล์ที่เพิ่งดาวน์โหลด ---
+                if downloaded_file_path and os.path.exists(downloaded_file_path):
+                    log_message_ui(
+                        f"--- [ส่วนที่ 2] ดาวน์โหลดสำเร็จ! กำลังเริ่ม Import ไฟล์: {os.path.basename(downloaded_file_path)} ---")
+                    process_excel_and_gsheet(downloaded_file_path, google_sheet_id_main, current_task_key)
+                else:
+                    log_message_ui(
+                        f"--- !!! ล้มเหลวในการดาวน์โหลดไฟล์สำหรับ '{current_task_key}' ไม่สามารถ Import ต่อได้ !!! ---")
+                    # ถ้าอยู่ในโหมด Run All, เราอาจจะเลือกที่จะทำงานต่อไป หรือหยุดเลย
+                    # ในที่นี้ เราจะแสดง Error แล้วทำงาน Task ต่อไป
+                    self.after(0, lambda key=current_task_key: messagebox.showwarning("ดาวน์โหลดล้มเหลว",
+                                                                                      f"ไม่สามารถดาวน์โหลดไฟล์สำหรับ '{key}' ได้\nจะข้ามไปทำงานส่วนถัดไป (ถ้ามี)"))
+                    continue  # ไปยัง Task ถัดไปใน Loop
+
+            log_message_ui("\n" + "=" * 15 + " กระบวนการอัตโนมัติทั้งหมดเสร็จสิ้น " + "=" * 15)
+
+        except Exception as e:
+            log_message_ui(f"เกิดข้อผิดพลาดร้ายแรงในกระบวนการอัตโนมัติ: {e}")
+            import traceback
+            log_message_ui(traceback.format_exc())
+            self.after(0,
+                       lambda err=e: messagebox.showerror("ข้อผิดพลาดร้ายแรง", f"เกิดข้อผิดพลาดที่ไม่คาดคิด:\n{err}"))
+        finally:
+            # --- จบกระบวนการ: เปิดปุ่มกลับมาเหมือนเดิม ---
+            self.import_auto_button.configure(state="normal", text="ดาวน์โหลด & Import อัตโนมัติ")
+            self.import_manual_button.configure(state="normal")
+            if progressbar:
+                progressbar.stop()
+                progressbar.set(0)
 
     def toggle_log_visibility(self):
         global log_frame_visible, log_textbox
@@ -837,7 +1451,7 @@ class App(ctk.CTk):
             log_message_ui(f"เกิดข้อผิดพลาดในการดึง ID ล่าสุดของ '{doc_type_display_name}': {e}")
             return None
 
-    def start_import_thread(self):
+    def start_manual_import_thread(self):
         if not self.selected_doc_type_key:
             messagebox.showerror("ข้อผิดพลาด", "กรุณาเลือกประเภทเอกสาร")
             return
@@ -865,7 +1479,7 @@ class App(ctk.CTk):
 
 
 
-    def run_import_process(self, excel_file, google_sheet_id_main, doc_type_key): # รับ doc_type_key
+    def run_manual_import_process(self, excel_file, google_sheet_id_main, doc_type_key): # รับ doc_type_key
         try:
             process_excel_and_gsheet(excel_file, google_sheet_id_main, doc_type_key) # ส่งต่อ
         finally:
@@ -1028,13 +1642,11 @@ def main():
         import traceback
         traceback.print_exc()
 
-
+# นี่คือ if __name__ == '__main__': ที่ถูกต้องและควรจะมีเพียงอันเดียว
 if __name__ == "__main__":
     if not os.path.exists("credentials.json"):
         messagebox.showwarning("Setup Required",
                                "ไม่พบไฟล์ 'credentials.json' สำหรับ OAuth 2.0.\n"
-                               "โปรแกรมอาจจะไม่สามารถยืนยันตัวตนกับ Google Sheets ได้.\n"
-                               "กรุณาสร้าง OAuth 2.0 Client ID (Desktop app) จาก Google Cloud Console "
-                               "และดาวน์โหลดไฟล์ JSON มาบันทึกเป็น 'credentials.json' ในโฟลเดอร์เดียวกับโปรแกรมนี้")
+                               "...")
     app_instance = App()
     app_instance.mainloop()
